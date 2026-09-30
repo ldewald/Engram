@@ -113,7 +113,7 @@ class StopFlag:
 
 class OwnedCommand:
     """One retained direct child. All methods are single-thread guardian-only."""
-    __slots__ = ("stop", "row", "process", "unproved", "terminal", "stdout", "stderr", "queue", "gate")
+    __slots__ = ("stop", "row", "process", "unproved", "terminal", "stdout", "stderr", "queue", "gate", "reader")
 
     def __init__(self, stop, label, argv, cwd, out, err, deadline_seconds):
         require(type(label) is str and label.isascii() and label.replace('-', '').isalnum(), "bad_label")
@@ -122,7 +122,7 @@ class OwnedCommand:
         require(cwd.is_absolute() and cwd.resolve(strict=True) == cwd, "bad_cwd")
         self.stop, self.process, self.unproved, self.terminal = stop, None, False, False
         self.stdout, self.stderr = out, err
-        self.queue, self.gate = None, None
+        self.queue, self.gate, self.reader = None, None, None
         self.row = {"label": label, "argv": argv, "cwd": str(cwd), "started": False,
                     "pid": None, "parentPID": os.getpid(), "startedMonotonicNS": None,
                     "deadlineSeconds": deadline_seconds, "primaryFailure": None,
@@ -146,7 +146,8 @@ class OwnedCommand:
         # child waits for registration before it execs any tool or product.
         self.queue = select.kqueue()
         os.set_inheritable(self.queue.fileno(), False)
-        reader, self.gate = os.pipe()
+        self.reader, self.gate = os.pipe()
+        reader = self.reader
         os.set_inheritable(reader, False)
         os.set_inheritable(self.gate, False)
         self.row["startedMonotonicNS"] = time.monotonic_ns()
@@ -189,7 +190,9 @@ class OwnedCommand:
                 self.row["primaryFailure"] = "spawn_unproved"
             raise
         finally:
-            os.close(reader)
+            if self.reader is not None:
+                reader, self.reader = self.reader, None
+                os.close(reader)
 
     def observe_terminal(self, end):
         require(self.process is not None and not self.row["leaderReaped"] and not self.unproved
@@ -282,7 +285,7 @@ class OwnedCommand:
                         if self.observe_terminal(term_end):
                             break
                         time.sleep(min(.01, max(0, term_end - time.monotonic())))
-                except CustodyFailure:
+                except BaseException:
                     # Broken notification grants nothing; the actual child has
                     # not been reaped. Final checked cleanup remains separate.
                     self.row['notificationCleanupFailure'] = 'exit_notification_unproved'
@@ -297,12 +300,22 @@ class OwnedCommand:
         raise CustodyFailure("cleanup_group_unproved")
 
     def close_observer(self):
-        if self.gate is not None:
-            os.close(self.gate)
-            self.gate = None
+        failed = False
+        for field in ('reader', 'gate'):
+            fd = getattr(self, field)
+            if fd is not None:
+                setattr(self, field, None)  # Never retry ambiguous close.
+                try:
+                    os.close(fd)
+                except OSError:
+                    failed = True
         if self.queue is not None:
-            self.queue.close()
-            self.queue = None
+            queue, self.queue = self.queue, None
+            try:
+                queue.close()
+            except OSError:
+                failed = True
+        require(not failed, 'observer_close_unproved')
 
     def run(self, env, *, uid=None, gid=None):
         try:
