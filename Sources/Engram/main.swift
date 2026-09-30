@@ -4,6 +4,8 @@ import LatticeInstallation
 import MCP
 import Foundation
 
+private enum OwnedSeedInitializationError: Error { case cleanupFailed }
+
 // Installer-owned new namespace only. This branch runs before stdout
 // reservation, crash hooks, signals, the watchdog and every ordinary store open.
 // No worker/sync/spoke/provider setup runs, and execution cannot fall through
@@ -19,7 +21,13 @@ if CommandLine.arguments.dropFirst().contains("--lattice-seed-store-v1") {
             Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self,
             configuration: configuration
         )
-        store.close()
+        let closed = store.closeChecked()
+        guard !closed.failed, !closed.cleanupFailed, closed.cleanupComplete else {
+            // An eventual process exit cannot erase a failure already reported
+            // by the real close path. The receiver turns this into a failed
+            // initializer reply, and the controller still joins the child.
+            throw OwnedSeedInitializationError.cleanupFailed
+        }
     }
     exit(status)
 }
