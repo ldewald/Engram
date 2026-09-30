@@ -30,7 +30,8 @@ import uuid
 # added after isolated startup; no site/user hook is evaluated by that startup.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from managed_startup_command_owner import (CommandOwner, StopFlag, CustodyFailure,
-                                          bounded_regular, file_fact, qualify_owner, require)
+                                          bounded_regular, exception_fact, file_fact,
+                                          qualify_nonzero_owner, qualify_owner, require)
 from managed_startup_case_observer import CASES
 
 CORE = '9ab6a910b3d471edfc8a4154693bcaa7071d892b'
@@ -146,6 +147,8 @@ class Guardian:
         self.private = directory(control / 'private')
         self.admin_receipts = directory(control / 'admin-receipts')
         self.admin = CommandOwner(self.stop, self.admin_receipts, self.private)
+        self.negative_owners = {}
+        self.negative_observations = {}
         self.product = None
         self.account = None
         self.mirror = None
@@ -228,12 +231,11 @@ class Guardian:
         require(not os.path.lexists(home) and identity(Path('/Users'))['uid'] == 0
                 and not identity(Path('/Users'))['mode'] & 0o022, 'account_home_namespace_unavailable')
         self.account = {'name': name, 'uid': uid, 'gid': gid, 'home': str(home),
-                        'generatedUID': str(uuid.uuid4()).upper(), 'created': False, 'retained': True}
+                        'generatedUID': None, 'created': False, 'retained': True}
         save(self.public / 'account-reservation.json', self.account)
         fields = [('UniqueID', str(uid)), ('PrimaryGroupID', str(gid)), ('NFSHomeDirectory', str(home)),
                   ('UserShell', '/usr/bin/false'), ('RealName', 'Lattice hosted qualification'),
-                  ('IsHidden', '1'), ('GeneratedUID', self.account['generatedUID']),
-                  ('AuthenticationAuthority', ';DisabledUser;')]
+                  ('IsHidden', '1'), ('AuthenticationAuthority', ';DisabledUser;')]
         self.admin_run('account-create', ['/usr/bin/dscl', '.', '-create', '/Users/' + name])
         self.account['created'] = True
         for number, (key, value) in enumerate(fields):
@@ -243,8 +245,15 @@ class Guardian:
                 and actual.pw_shell == '/usr/bin/false' and name not in grp.getgrnam('admin').gr_mem,
                 'dedicated_account_binding_unproved')
         row = self.admin_run('account-identity', ['/usr/bin/dscl', '.', '-read', '/Users/' + name, 'GeneratedUID'])
-        require(bounded_regular(Path(row['stdout']), 4096).decode().strip()
-                == 'GeneratedUID: ' + self.account['generatedUID'], 'directory_service_identity_changed')
+        # Directory Services assigns this identity. Never replace it with a
+        # caller-generated value, and never infer it from record creation alone.
+        actual_guid = bounded_regular(Path(row['stdout']), 4096).decode('ascii')
+        matched = re.fullmatch(r'GeneratedUID: ([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\n?', actual_guid)
+        require(matched is not None, 'directory_service_identity_unproved')
+        generated_uid = matched.group(1)
+        require(uuid.UUID(generated_uid).int != 0 and str(uuid.UUID(generated_uid)).upper() == generated_uid,
+                'directory_service_identity_unproved')
+        self.account['generatedUID'] = generated_uid
         directory(home, uid=uid, gid=gid)
         directory(home / 'localdev', uid=uid, gid=gid)
         self.workspace = directory(home / 'localdev/managed-startup', uid=uid, gid=gid)
@@ -269,6 +278,36 @@ class Guardian:
         self.account.update(homeIdentity=identity(home), workspaceIdentity=identity(self.workspace))
         save(self.public / 'actual-account.json', self.account)
         self.census('initial')
+
+    def negative_preflight(self, role, *, cwd, env, uid=None, gid=None):
+        require(role in ('root', 'dedicated') and role not in self.negative_owners,
+                'negative_preflight_role_reused')
+        self.budget(10)
+        receipts = directory(self.control / ('negative-' + role + '-receipts'))
+        private = directory(self.control / ('negative-' + role + '-private'))
+        owner = CommandOwner(self.stop, receipts, private)
+        self.negative_owners[role] = owner  # Retain before any actual spawn.
+        observation = {'schemaVersion': 1, 'kind': 'actual-nonzero-owner-preflight', 'role': role,
+                       'qualified': False, 'primaryFailure': None, 'exception': None,
+                       'descendantOrInstallationAuthority': False}
+        self.negative_observations[role] = observation
+        failure = None
+        try:
+            qualify_nonzero_owner(owner, cwd=cwd, env=env, uid=uid, gid=gid)
+            observation['qualified'] = True
+        except BaseException as caught:
+            failure = caught
+            observation['primaryFailure'] = str(caught) if isinstance(caught, CustodyFailure) else 'negative_preflight_exception'
+            observation['exception'] = exception_fact(caught)
+        observation.update(ownerFailed=owner.failed, actualCommands=[value.row for value in owner.owners])
+        try:
+            save(self.public / (role + '-negative-owner-preflight.json'), observation)
+        except BaseException:
+            self.results['cleanupFailures'].append('negative_preflight_receipt_unproved')
+            if failure is None:
+                failure = CustodyFailure('negative_preflight_receipt_unproved')
+        if failure is not None:
+            raise failure
 
     def checkout(self):
         self.results['stage'] = 'source-checkout'
@@ -302,6 +341,7 @@ class Guardian:
         self.budget(30)
         save(self.public / 'dedicated-owner-preflight.json', qualify_owner(self.product, cwd=self.engram,
              env=self.env, uid=self.uid, gid=self.gid))
+        self.negative_preflight('dedicated', cwd=self.engram, env=self.env, uid=self.uid, gid=self.gid)
         self.census('preflight')
 
     def artifact(self, operation, seconds=120):
@@ -431,6 +471,7 @@ class Guardian:
             self.results['cleanupFailures'].append('metadata_export_unproved')
         self.results['rootCommands'] = [owner.row for owner in self.admin.owners]
         self.results['productCommands'] = [] if self.product is None else [owner.row for owner in self.product.owners]
+        self.results['negativeOwnerPreflights'] = self.negative_observations
         self.results['account'] = self.account
         self.results['trustCleanup'] = {'adHocSigningOnly': True, 'keychainImported': False,
             'trustOverrideInstalled': False, 'certificateSearchListChanged': False}
@@ -443,6 +484,8 @@ class Guardian:
             self.results['primaryFailure'] = 'guardian_deadline'
         self.results['overallDeadlineSeconds'] = BUDGET_SECONDS
         self.results['qualified'] = (self.results['all13OriginalMethodsPassed']
+            and set(self.negative_observations) == {'root', 'dedicated'}
+            and all(row['qualified'] and row['ownerFailed'] for row in self.negative_observations.values())
             and self.results['primaryFailure'] is None and not self.results['cleanupFailures']
             and not self.results.get('missingMetadataReceipts', ['unobserved'])
             and not self.stop.requested and all(row['leaderReaped'] and row['groupGone'] and row['success']
@@ -459,6 +502,7 @@ class Guardian:
         try:
             self.budget(30)
             save(self.public / 'root-owner-preflight.json', qualify_owner(self.admin, cwd=self.control, env=self.root_env))
+            self.negative_preflight('root', cwd=self.control, env=self.root_env)
             self.create_account()
             self.checkout()
             self.build_and_install()

@@ -29,6 +29,20 @@ def require(value, code):
         raise CustodyFailure(code)
 
 
+def exception_fact(failure):
+    """Closed scalar diagnostic; never exports an exception's text or path."""
+    kind = 'other'
+    for cls, name in ((CustodyFailure, 'custody_failure'),
+                      (PermissionError, 'permission_error'), (ProcessLookupError, 'process_lookup_error'),
+                      (ChildProcessError, 'child_process_error'), (InterruptedError, 'interrupted_error'),
+                      (TimeoutError, 'timeout_error'), (OSError, 'os_error'), (ValueError, 'value_error')):
+        if isinstance(failure, cls):
+            kind = name
+            break
+    number = failure.errno if isinstance(failure, OSError) else None
+    return {'kind': kind, 'errno': number if type(number) is int and 0 <= number <= 65535 else None}
+
+
 def bounded_regular(path: Path, maximum: int, *, empty=False) -> bytes:
     require(path.is_absolute() and path.resolve(strict=True) == path, "noncanonical_file")
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -126,9 +140,11 @@ class OwnedCommand:
         self.row = {"label": label, "argv": argv, "cwd": str(cwd), "started": False,
                     "pid": None, "parentPID": os.getpid(), "startedMonotonicNS": None,
                     "deadlineSeconds": deadline_seconds, "primaryFailure": None,
-                    "cleanupFailure": None, "terminalObservedWithoutReap": False,
+                    "cleanupFailure": None, "primaryException": None, "cleanupException": None,
+                    "terminalObservedWithoutReap": False,
                     "exitObserverRegistered": False, "execGateReleased": False,
-                    "leaderReaped": False, "rawWaitStatus": None, "exitCode": None, "observedExitCode": None,
+                    "leaderReaped": False, "rawWaitStatus": None, "exitCode": None,
+                    "observedRawWaitStatus": None, "observedExitCode": None,
                     "groupGone": False, "groupSignals": [], "success": False,
                     "positiveCustodyScope": "direct-leader-and-same-group-only",
                     "unknownSessionEscapesProvenAbsent": False}
@@ -214,7 +230,12 @@ class OwnedCommand:
                     'unexpected_exit_event')
             self.terminal = True
             self.row["terminalObservedWithoutReap"] = True
-            self.row["observedExitCode"] = event.data
+            # NOTE_EXITSTATUS carries a wait status, not the decoded exit code.
+            # Notification is still provisional: only checked waitpid reaps.
+            require(type(event.data) is int and 0 <= event.data <= 0xffffffff,
+                    'exit_notification_status_unproved')
+            self.row["observedRawWaitStatus"] = event.data
+            self.row["observedExitCode"] = os.waitstatus_to_exitcode(event.data)
             return True
         return False
 
@@ -224,12 +245,21 @@ class OwnedCommand:
         self.default_reaping()
         # A kqueue-observed terminal child is still unreaped and reserves its PID.
         # A successful actual reap permanently forbids this operation.
+        require(len(self.row["groupSignals"]) < 2, "group_signal_limit")
+        failure_fact = None
         try:
             os.killpg(self.process.pid, number)
             outcome = "sent"
-        except ProcessLookupError:
+        except ProcessLookupError as failure:
             outcome = "group_absent"
-        self.row["groupSignals"].append({"signal": int(number), "result": outcome})
+            failure_fact = exception_fact(failure)
+        except OSError as failure:
+            # The signal did not establish closure. Preserve its exact finite
+            # observation and continue to the owned child's checked wait/reap.
+            outcome = "os_error"
+            failure_fact = exception_fact(failure)
+        self.row["groupSignals"].append({"signal": int(number), "result": outcome,
+                                         "exception": failure_fact})
 
     def reap(self, end, *, failure_cleanup=False):
         require((self.terminal or failure_cleanup) and not self.unproved and not self.row["leaderReaped"],
@@ -257,6 +287,8 @@ class OwnedCommand:
             self.row["rawWaitStatus"] = status
             self.process.returncode = os.waitstatus_to_exitcode(status)
             self.row["exitCode"] = self.process.returncode
+            if self.row["observedRawWaitStatus"] is not None:
+                require(status == self.row["observedRawWaitStatus"], "exit_notification_wait_mismatch")
             return
         raise CustodyFailure("reap_deadline")
 
@@ -285,10 +317,11 @@ class OwnedCommand:
                         if self.observe_terminal(term_end):
                             break
                         time.sleep(min(.01, max(0, term_end - time.monotonic())))
-                except BaseException:
+                except BaseException as failure:
                     # Broken notification grants nothing; the actual child has
                     # not been reaped. Final checked cleanup remains separate.
                     self.row['notificationCleanupFailure'] = 'exit_notification_unproved'
+                    self.row['notificationCleanupException'] = exception_fact(failure)
             # Kill the failure group before the sole reap. No later signal is
             # possible once waitpid returns that actual child PID.
             self.signal_group(signal.SIGKILL)
@@ -341,10 +374,12 @@ class OwnedCommand:
         except BaseException as failure:
             if self.row["primaryFailure"] is None:
                 self.row["primaryFailure"] = str(failure) if isinstance(failure, CustodyFailure) else "command_exception"
+                self.row["primaryException"] = exception_fact(failure)
             try:
                 self.retire_failed(time.monotonic() + 30)
             except BaseException as cleanup:
                 self.row["cleanupFailure"] = str(cleanup) if isinstance(cleanup, CustodyFailure) else "cleanup_exception"
+                self.row["cleanupException"] = exception_fact(cleanup)
             raise
 
 
@@ -434,6 +469,7 @@ def qualify_owner(owner, *, cwd, env, uid=None, gid=None):
         row = owner.run(label, ['/usr/bin/true'], cwd=cwd, env=env, seconds=10, uid=uid, gid=gid)
         require(row['exitObserverRegistered'] and row['execGateReleased']
                 and row['terminalObservedWithoutReap'] and row['leaderReaped']
+                and row['observedRawWaitStatus'] == 0 and row['observedExitCode'] == 0
                 and row['rawWaitStatus'] == 0 and row['exitCode'] == 0 and row['groupGone']
                 and not row['groupSignals'] and row['primaryFailure'] is None
                 and row['cleanupFailure'] is None, 'actual_owner_preflight_failed')
@@ -441,3 +477,30 @@ def qualify_owner(owner, *, cwd, env, uid=None, gid=None):
     return {'runtime': runtime, 'actualCommands': commands,
             'positiveScope': 'two actually retained direct-child exec/exit/reap observations',
             'descendantOrInstallationAuthority': False}
+
+
+def qualify_nonzero_owner(owner, *, cwd, env, uid=None, gid=None):
+    """Real failure-path proof on a separate owner that stays permanently failed."""
+    require(not owner.owners and not owner.failed, 'negative_preflight_owner_already_used')
+    try:
+        owner.run('owner-preflight-nonzero', ['/usr/bin/false'], cwd=cwd, env=env,
+                  seconds=10, uid=uid, gid=gid)
+    except CustodyFailure as failure:
+        require(str(failure) == 'command_nonzero', 'negative_preflight_wrong_failure')
+    else:
+        raise CustodyFailure('negative_preflight_unexpected_success')
+    require(owner.failed and len(owner.owners) == 1, 'negative_preflight_owner_not_failed')
+    row = owner.owners[0].row
+    require(row['started'] and row['exitObserverRegistered'] and row['execGateReleased']
+            and row['terminalObservedWithoutReap'] and row['observedExitCode'] == 1
+            and type(row['observedRawWaitStatus']) is int
+            and row['rawWaitStatus'] == row['observedRawWaitStatus']
+            and row['leaderReaped'] and row['exitCode'] == 1 and row['groupGone']
+            and not row['success'] and row['primaryFailure'] == 'command_nonzero'
+            and row['cleanupFailure'] is None and not owner.owners[0].unproved
+            and not any(key in row for key in ('notificationCleanupFailure', 'observerCloseFailure',
+                                               'logCloseFailure', 'logObservationFailure')),
+            'negative_preflight_closure_unproved')
+    # Signal errors remain in groupSignals. They grant no custody; the exact
+    # actual status/reap/group absence above is the closure evidence. No failed
+    # owner is reset or reused for a successful product/admin command.
