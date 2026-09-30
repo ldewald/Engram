@@ -331,6 +331,9 @@ class OwnedCommand:
                     require(self.group_absent(), "remaining_group_unproved")
                     require(self.row["exitCode"] == 0, "command_nonzero")
                     require(not self.stop.requested, "guardian_canceled")
+                    # Reap and group observation can themselves return late.
+                    # Keep the real reap recorded, but never qualify late success.
+                    require(time.monotonic() < end, "command_deadline")
                     self.row["success"] = True
                     return self.row
                 time.sleep(min(.01, max(0, end - time.monotonic())))
