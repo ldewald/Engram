@@ -194,17 +194,27 @@ class Guardian:
     def census(self, label):
         # Supplemental detection only. It cannot prove descendant retirement.
         row = self.admin_run('census-' + label,
-            ['/bin/ps', '-axo', 'pid=,ppid=,pgid=,uid=,ruid=,svuid='], seconds=30)
+            ['/bin/ps', '-axo', 'pid=,ppid=,pgid=,uid=,ruid=,svuid=,ucomm='], seconds=30)
         raw = bounded_regular(Path(row['stdout']), 4 * 1024 * 1024, empty=True)
         require(len(raw.splitlines()) <= 32768, 'census_size')
         matching = []
         for line in raw.splitlines():
-            cells = line.split()
-            require(len(cells) == 6 and all(re.fullmatch(rb'[0-9]+', part) for part in cells), 'census_unproved')
-            values = [int(part) for part in cells]
+            cells = line.split(maxsplit=6)
+            require(len(cells) >= 6 and all(re.fullmatch(rb'[0-9]+', part) for part in cells[:6]), 'census_unproved')
+            values = [int(part) for part in cells[:6]]
             if self.uid in values[3:]:
-                matching.append(dict(zip(('pid', 'ppid', 'pgid', 'uid', 'ruid', 'svuid'), values)))
+                observed = dict(zip(('pid', 'ppid', 'pgid', 'uid', 'ruid', 'svuid'), values))
+                # ucomm reports a short kernel command name, not argv or an
+                # executable identity. It may be truncated or misleading and
+                # can never exempt a process from the refusal below.
+                name = cells[6].strip() if len(cells) == 7 else b''
+                require(len(name) <= 4096, 'census_command_name_bound')
+                observed.update(kernelCommandName=name.decode('ascii')
+                    if re.fullmatch(rb'[A-Za-z0-9_.+-]{1,64}', name) else None,
+                    kernelCommandNameBytes=len(name), kernelCommandNameSHA256=hashlib.sha256(name).hexdigest())
+                matching.append(observed)
         save(self.public / (label + '-census.json'), {'records': matching, 'supplementalOnly': True,
+             'kernelCommandNamesAreDiagnosticOnly': True,
              'doesNotProveDescendantsRetired': True, 'logFact': file_fact(Path(row['stdout']), 4 * 1024 * 1024, empty=True)})
         require(not matching, 'unexpected_account_process_unproved')
 
