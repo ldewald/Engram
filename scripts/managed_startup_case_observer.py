@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import stat
 import struct
 import subprocess
@@ -103,6 +104,10 @@ class Registry:
         self.observation_failed = False
 
     def reserve(self, argv, options):
+        # Popen treats ECHILD as exit zero when SIGCHLD is ignored. The
+        # source-bound driver must retain the default disposition and remain
+        # the exclusive reaper; otherwise its return code cannot prove a wait.
+        require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL)
         require(len(self.rows) < len(self.expected) <= 2 and type(argv) is list
                 and all(type(value) is str for value in argv)
                 and options.get("start_new_session") is True)
@@ -167,6 +172,7 @@ class Registry:
         return ObservedPopen
 
     def finish(self):
+        require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL)
         require(not self.observation_failed and len(self.rows) == len(self.expected)
                 and len(self.objects) == len(self.rows))
         for row, process in zip(self.rows, self.objects):
@@ -271,6 +277,7 @@ def main():
             and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
             and os.environ.get("ENGRAM_MANAGED_HOSTED_GATE") == "1"
             and os.geteuid() != 0 and len(sys.argv) == 3 and sys.argv[1] in CASES)
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL)
     name, output = sys.argv[1], Path(sys.argv[2])
     root = Path(__file__).resolve().parents[1]
     cli = Path(os.environ["ENGRAM_INSTALLATION_CLI"]).resolve(strict=True)
@@ -288,7 +295,8 @@ def main():
     try:
         origin = load(root / "Tests/test_managed_installation_origin.py", "test_managed_installation_origin")
         normal = load(root / "Tests/test_managed_normal_startup.py", "test_managed_normal_startup")
-        facade = types.SimpleNamespace(Popen=registry.factory(), TimeoutExpired=subprocess.TimeoutExpired)
+        facade = types.SimpleNamespace(Popen=registry.factory(), TimeoutExpired=subprocess.TimeoutExpired,
+                                       PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL)
         for module in (origin, normal):
             originals[module] = module.subprocess
             module.subprocess = facade
