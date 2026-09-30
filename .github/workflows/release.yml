@@ -271,6 +271,12 @@ jobs:
             -exportPath build/export \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
 
+      - name: Restore committed mirror after all Swift and Xcode builds
+        run: |
+          # The checksum-preserving localhost Sparkle transport is build-local.
+          # Restore it before the launcher's strict clean-source verification.
+          git restore --source="$EXPECTED_SHA" -- .swiftpm/configuration/mirrors.json
+
       - name: Bundle CLI binaries into .app
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
         env:
@@ -457,9 +463,6 @@ jobs:
 
       - name: Recheck exact source and emit packaged release receipt
         run: |
-          # The checksum-preserving localhost Sparkle transport is build-local.
-          # Restore the committed SDK mirror configuration before source checks.
-          git restore --source="$EXPECTED_SHA" -- .swiftpm/configuration/mirrors.json
           python3 release-train/release_train.py candidate --version "${RELEASE_TAG#v}" --expected-sha "$EXPECTED_SHA" --output "$RUNNER_TEMP/candidate.json" --packaged
           python3 release-train/release_train.py workflow-receipt --candidate "$RUNNER_TEMP/candidate.json" --output "$RUNNER_TEMP/release-receipt.json" \
             --artifact "cli=build/engram-macos-arm64.tar.gz" --artifact "dmg=build/Engram-${RELEASE_TAG#v}.dmg" --artifact "appcast=appcast.xml" \
