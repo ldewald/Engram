@@ -15,7 +15,7 @@ from generate_installation_build_stamp import header_bytes, signed_input_facts, 
 
 SOURCES = ("main.cpp", "owned_launch.cpp", "installation_manifest.cpp",
            "installation_cohort.cpp", "installation_files.cpp", "installation_seed.cpp",
-           "store_admission.cpp", "engram_product_installer.cpp")
+           "store_admission.cpp", "engram_product_installer.cpp", "normal_startup.cpp")
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -61,7 +61,7 @@ def main() -> None:
                   "coreRevision": core_revision, "coreTree": core_tree, "initializer": facts,
                   "isRegistration": False, "requiresFinalLauncherProvenance": True}
     (build / "build-inputs.json").write_text(json.dumps(provenance, indent=2) + "\n")
-    # A direct eight-TU native link graph: no Swift manifest, app initialization,
+    # A direct nine-TU native link graph: no Swift manifest, app initialization,
     # LatticeCore library, SQLite or process-global application service.
     command = ["xcrun", "--sdk", "macosx", "clang++", "-std=c++20", "-O2", "-pthread",
                f'-DLATTICE_ENGRAM_BUILD_STAMP_HEADER="{stamp}"',

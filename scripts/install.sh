@@ -17,6 +17,23 @@ if [ "${1:-}" = "--create-managed-origin" ]; then
     exec "$INSTALL_DIR/memory-installation-launcher" create-engram "$2" "$3"
 fi
 
+# One supported normal path: a new primary-only origin and its live MCP child.
+# The native controller independently checks the OS-account installation
+# authority before creating anything; this argument grants no authority.
+if [ "${1:-}" = "--create-and-run-managed-mcp" ]; then
+    if [ "$#" -ne 3 ]; then
+        echo "Managed MCP startup requires a new parent/name." >&2
+        exit 64
+    fi
+    exec "$INSTALL_DIR/memory-installation-launcher" create-and-run-engram-mcp "$2" "$3"
+fi
+
+EXPECTED_INSTALL_DIR="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.geteuid()).pw_dir + "/.claude/bin")')"
+if [ "$INSTALL_DIR" != "$EXPECTED_INSTALL_DIR" ]; then
+    echo "Installation requires the OS account home; an overridden HOME cannot publish managed authority." >&2
+    exit 64
+fi
+
 echo "Engram Installer"
 echo "================"
 echo ""
@@ -77,6 +94,11 @@ else
     # Preserve release signatures: the sync daemon needs its Developer ID
     # identity for keychain access when launched without a visible prompt.
 fi
+
+# Publish outside the package only as part of this authorized installation.
+# Normal launcher/receiver paths never invoke the publisher or repair state.
+INSTALL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 -B "$INSTALL_SCRIPT_DIR/publish_managed_installation_root.py"
 
 echo "Installed to $INSTALL_DIR"
 

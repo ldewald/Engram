@@ -32,6 +32,40 @@ if CommandLine.arguments.dropFirst().contains("--lattice-seed-store-v1") {
     exit(status)
 }
 
+// A managed invocation must finish its actual inherited context exchange
+// before log files, watchdogs, cache lookups or database constructors. The
+// command-line switch identifies the receiver only; it grants no authority.
+let installationStartup: LatticeInstallationNormalStartup?
+if CommandLine.arguments.dropFirst().contains("--lattice-managed-mcp-v1") {
+    guard CommandLine.arguments.count == 2,
+          CommandLine.arguments[1] == "--lattice-managed-mcp-v1" else { exit(64) }
+    do {
+        let startup = try LatticeInstallationNormalStartup.receiveEngramPrimary()
+        guard ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"] == startup.primaryURL.path else { exit(74) }
+        // This first supported profile owns only a newly seeded primary file.
+        // Refuse extra store membership explicitly; do not open it without a
+        // context, drop its schemas, or silently pretend it was not discovered.
+        let directory = startup.primaryURL.deletingLastPathComponent().path
+        let synced = SyncService.syncedDbPath(claudeDir: directory)
+        // The legacy convenience discovery returns [] on a listing error.
+        // Managed admission must observe the directory successfully instead.
+        let optionalNames = try FileManager.default.contentsOfDirectory(atPath: directory + "/sync")
+        guard !FileManager.default.fileExists(atPath: synced),
+              !optionalNames.contains(where: { $0.hasPrefix("group-") && $0.hasSuffix(".sqlite") }) else {
+            let message = Array("Engram: managed primary profile requires registered synced/group stores\n".utf8)
+            message.withUnsafeBytes { _ = write(STDERR_FILENO, $0.baseAddress, $0.count) }
+            exit(74)
+        }
+        installationStartup = startup
+    } catch {
+        let message = Array("Engram: managed startup refused\n".utf8)
+        message.withUnsafeBytes { _ = write(STDERR_FILENO, $0.baseAddress, $0.count) }
+        exit(74)
+    }
+} else {
+    installationStartup = nil
+}
+
 // Keep MCP framing separate from process-wide stdout. Native model libraries
 // can emit diagnostics with printf, including from background loading threads.
 // Reserve the original stdout pipe before explicit startup initialization, then route
@@ -123,6 +157,7 @@ let localLattice: Lattice
 do {
     var localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
     localConfig.busyTimeoutMs = mcpBusyTimeoutMs
+    if let installationStartup { localConfig = try installationStartup.configuration(localConfig) }
     localLattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self, configuration: localConfig)
     log("Database at \(dbPath)")
 } catch {
@@ -141,6 +176,10 @@ let syncedLattice: Lattice?
 let claudeDir = (dbPath as NSString).deletingLastPathComponent
 let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
 if FileManager.default.fileExists(atPath: syncedDbPath) {
+    if installationStartup != nil {
+        log("EXIT: managed primary profile cannot open an unregistered synced store")
+        exit(74)
+    }
     var syncedConfig: Lattice.Configuration = .init(
         fileURL: URL(fileURLWithPath: syncedDbPath),
         migration: engramMigrations
@@ -168,6 +207,10 @@ if FileManager.default.fileExists(atPath: syncedDbPath) {
 // per-read stat() guard picks up. Plain opens: no WSS, no IPC.
 var groupRefs: [MemoryTools.GroupSpokeRef] = []
 for spoke in SyncService.discoverGroupSpokes(claudeDir: claudeDir) {
+    if installationStartup != nil {
+        log("EXIT: managed primary profile cannot open an unregistered group store")
+        exit(74)
+    }
     var spokeConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: spoke.path),
                                                    migration: engramMigrations)
     spokeConfig.busyTimeoutMs = mcpBusyTimeoutMs
