@@ -207,6 +207,8 @@ class ActualManagedNormalStartup(unittest.TestCase):
         self.transcript.close()
 
     def test_actual_managed_mcp_keeps_original_schema_and_committed_checkpoint_behavior(self):
+        self.assertEqual(list(self.parent.iterdir()), [])
+        self.assertFalse((self.parent / "owned/data/sync").exists())
         self.start()
         request = self.send("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "managed-normal-qualification", "version": "1"}})

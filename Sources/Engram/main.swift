@@ -5,6 +5,7 @@ import MCP
 import Foundation
 
 private enum OwnedSeedInitializationError: Error { case cleanupFailed }
+private enum ManagedNormalStartupError: Error { case optionalDirectoryUnavailable }
 
 // Installer-owned new namespace only. This branch runs before stdout
 // reservation, crash hooks, signals, the watchdog and every ordinary store open.
@@ -46,11 +47,21 @@ if CommandLine.arguments.dropFirst().contains("--lattice-managed-mcp-v1") {
         // Refuse extra store membership explicitly; do not open it without a
         // context, drop its schemas, or silently pretend it was not discovered.
         let directory = startup.primaryURL.deletingLastPathComponent().path
-        let synced = SyncService.syncedDbPath(claudeDir: directory)
-        // The legacy convenience discovery returns [] on a listing error.
-        // Managed admission must observe the directory successfully instead.
-        let optionalNames = try FileManager.default.contentsOfDirectory(atPath: directory + "/sync")
-        guard !FileManager.default.fileExists(atPath: synced),
+        let optionalDirectory = directory + "/sync"
+        var optionalMetadata = stat()
+        let optionalNames: [String]
+        if lstat(optionalDirectory, &optionalMetadata) != 0 {
+            guard errno == ENOENT else { throw ManagedNormalStartupError.optionalDirectoryUnavailable }
+            optionalNames = [] // Actual absent entry only; this preflight creates nothing.
+        } else {
+            guard UInt32(optionalMetadata.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR) else {
+                throw ManagedNormalStartupError.optionalDirectoryUnavailable
+            }
+            // The legacy convenience discovery hides listing failures. A
+            // present directory must actually be observed successfully here.
+            optionalNames = try FileManager.default.contentsOfDirectory(atPath: optionalDirectory)
+        }
+        guard !optionalNames.contains("memory-synced.sqlite"),
               !optionalNames.contains(where: { $0.hasPrefix("group-") && $0.hasSuffix(".sqlite") }) else {
             let message = Array("Engram: managed primary profile requires registered synced/group stores\n".utf8)
             message.withUnsafeBytes { _ = write(STDERR_FILENO, $0.baseAddress, $0.count) }
