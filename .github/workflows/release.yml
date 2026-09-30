@@ -304,6 +304,16 @@ jobs:
             sign "$bin"
           done
 
+          # Compile the dedicated installer only after memory has its final
+          # signature, then bind the final signed installer bytes as well.
+          # Old dependency graphs fail here; a decoded stamp is never enrollment.
+          INSTALLER_BUILD="build/installation-launcher-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -B scripts/build_installation_launcher.py \
+            --final-cli-directory "$CLI_DIR" --build-directory "$INSTALLER_BUILD"
+          sign "$CLI_DIR/memory-installation-launcher"
+          python3 -B scripts/finalize_installation_provenance.py \
+            --final-cli-directory "$CLI_DIR" --build-inputs "$INSTALLER_BUILD/build-inputs.json"
+
           # Sign Sparkle components bottom-up (--deep is deprecated and unreliable
           # for nested XPC services — causes TeamIdentifier=not set on Installer.xpc,
           # which triggers the App Management permission prompt on macOS Ventura+)
@@ -331,6 +341,9 @@ jobs:
             cp "$CLI/memory" build/staging/memory
             cp "$CLI/memory-hooks" build/staging/memory-hooks
             cp "$CLI/memory-sync" build/staging/memory-sync
+            cp "$CLI/memory-installation-launcher" build/staging/memory-installation-launcher
+            cp "$CLI/engram-installation.provenance" build/staging/engram-installation.provenance
+            cp "$CLI/engram-installation-provenance.json" build/staging/engram-installation-provenance.json
           else
             cp .build/release/Engram build/staging/memory
             cp .build/release/EngramHooks build/staging/memory-hooks

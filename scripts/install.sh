@@ -4,6 +4,19 @@ set -e
 INSTALL_DIR="$HOME/.claude/bin"
 REPO="jsflax/Engram"
 
+# Explicit new-origin operation. It runs before cleanup, downloads, MCP
+# registration, daemons or any ordinary store open. Existing/partial namespaces
+# and unstamped packages are refused by the retained native controller. This
+# does not migrate a legacy store or claim custody of GUI/host processes.
+if [ "${1:-}" = "--create-managed-origin" ]; then
+    if [ "$#" -ne 3 ] || [ ! -x "$INSTALL_DIR/memory-installation-launcher" ] || \
+       [ ! -f "$INSTALL_DIR/engram-installation.provenance" ]; then
+        echo "Managed origin unavailable: exact installed launcher and parent/name are required." >&2
+        exit 64
+    fi
+    exec "$INSTALL_DIR/memory-installation-launcher" create-engram "$2" "$3"
+fi
+
 echo "Engram Installer"
 echo "================"
 echo ""
@@ -36,6 +49,16 @@ if [ "$1" = "--from-source" ]; then
     codesign --force --sign - "$INSTALL_DIR/memory"
     codesign --force --sign - "$INSTALL_DIR/memory-hooks"
     codesign --force --sign - "$INSTALL_DIR/memory-sync"
+    # Product-byte stamp follows memory's last signing operation. This does
+    # not enroll existing stores or authorize normal managed application opens.
+    rm -f "$INSTALL_DIR/memory-installation-launcher" "$INSTALL_DIR/engram-installation.provenance" \
+        "$INSTALL_DIR/engram-installation-provenance.json"
+    INSTALLER_BUILD="$REPO_DIR/.build/installation-launcher-$(date +%s)-$$"
+    python3 -B "$REPO_DIR/scripts/build_installation_launcher.py" \
+        --final-cli-directory "$INSTALL_DIR" --build-directory "$INSTALLER_BUILD"
+    codesign --force --sign - "$INSTALL_DIR/memory-installation-launcher"
+    python3 -B "$REPO_DIR/scripts/finalize_installation_provenance.py" \
+        --final-cli-directory "$INSTALL_DIR" --build-inputs "$INSTALLER_BUILD/build-inputs.json"
 else
     echo "Downloading latest release..."
     DOWNLOAD_URL=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
