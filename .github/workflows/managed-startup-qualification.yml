@@ -4,7 +4,7 @@ name: Actual Engram managed startup qualification
 # The existing release workflow/public package pins are not changed.
 on:
   push:
-    branches: ['codex/engram-managed-startup-registration-20260930']
+    branches: ['codex/engram-managed-startup-registration-002-20260930']
   workflow_dispatch:
     inputs:
       managed_startup_gate:
@@ -38,7 +38,7 @@ jobs:
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_RUN_ATTEMPT" = 1
-          test "$GITHUB_REPOSITORY" = jsflax/engram
+          test "$GITHUB_REPOSITORY" = jsflax/Engram
           test "$RUNNER_OS" = macOS
           test "$ENGRAM_WORKFLOW_SHA" = "$GITHUB_SHA"
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
