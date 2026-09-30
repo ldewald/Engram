@@ -131,6 +131,7 @@ let package = Package(
                 "EngramKit",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "lattice"),
+                .product(name: "LatticeInstallation", package: "lattice"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),

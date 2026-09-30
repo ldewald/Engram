@@ -1,7 +1,28 @@
 import EngramKit
 import Lattice
+import LatticeInstallation
 import MCP
 import Foundation
+
+// Installer-owned new namespace only. This branch runs before stdout
+// reservation, crash hooks, signals, the watchdog and every ordinary store open.
+// No worker/sync/spoke/provider setup runs, and execution cannot fall through
+// into the normal MCP server after the inherited exchange. The controller owns
+// and waits for this exact process; a callback reply is not a retirement proof.
+if CommandLine.arguments.dropFirst().contains("--lattice-seed-store-v1") {
+    guard CommandLine.arguments.count == 2,
+          CommandLine.arguments[1] == "--lattice-seed-store-v1" else { exit(64) }
+    let status = LatticeInstallationInitializer.receiveEngramSeed { exactURL in
+        var configuration = Lattice.Configuration(fileURL: exactURL, migration: engramMigrations)
+        configuration.busyTimeoutMs = 2_000
+        let store = try Lattice(
+            Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self,
+            configuration: configuration
+        )
+        store.close()
+    }
+    exit(status)
+}
 
 // Keep MCP framing separate from process-wide stdout. Native model libraries
 // can emit diagnostics with printf, including from background loading threads.
