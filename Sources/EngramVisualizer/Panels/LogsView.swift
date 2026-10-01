@@ -11,7 +11,13 @@ struct LogSource: Identifiable, Sendable {
 
 /// Parsed log entry from a log file.
 struct LogEntry: Identifiable, Equatable, Sendable {
-    let id: Int
+    /// Where the line starts in its file, so a line keeps its id as the tail moves.
+    struct ID: Hashable, Sendable {
+        let source: String
+        let offset: UInt64
+    }
+
+    let id: ID
     let timestamp: Date?
     let source: String
     let message: String
@@ -31,9 +37,7 @@ final class LogsStore {
     }
     var autoScroll = true
     private(set) var filteredEntries: [LogEntry] = []
-    /// Keyed by raw line rather than id: ids are positions in the merged tail
-    /// and shift whenever a capped log file gains a line.
-    private var expandedEntries: Set<String> = []
+    private var expandedEntries: Set<LogEntry.ID> = []
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored nonisolated(unsafe) private var worker: Task<Void, Never>?
     @ObservationIgnored nonisolated(unsafe) private var continuation: AsyncStream<Void>.Continuation?
@@ -82,12 +86,12 @@ final class LogsStore {
     }
 
     func isExpanded(_ entry: LogEntry) -> Bool {
-        expandedEntries.contains(entry.raw)
+        expandedEntries.contains(entry.id)
     }
 
     func toggleExpanded(_ entry: LogEntry) {
-        if expandedEntries.remove(entry.raw) == nil {
-            expandedEntries.insert(entry.raw)
+        if expandedEntries.remove(entry.id) == nil {
+            expandedEntries.insert(entry.id)
         }
     }
 

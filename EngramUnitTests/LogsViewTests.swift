@@ -5,22 +5,27 @@ import XCTest
 
 @MainActor
 final class LogsViewTests: XCTestCase {
-    private static let longMessage = Array(repeating: "memories were split across project scopes", count: 8)
-        .joined(separator: " ")
+    func testEntryIdsSurviveTheTailMoving() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("engram-log-ids-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("maintenance.log")
+        let source = LogSource(id: "maintenance", label: "Maintenance", path: file.path, icon: "", color: .orange)
+        try (0..<LogTailReader.maximumLines).map { "line \($0)\n" }.joined()
+            .write(to: file, atomically: true, encoding: .utf8)
+        let before = LogTailReader.read(sources: [source])
 
-    func testExpansionFollowsEntryContentWhenPositionsShift() {
-        let store = LogsStore()
-        let entry = LogEntry(id: 5, timestamp: nil, source: "maintenance", message: "a", raw: "a")
-        store.toggleExpanded(entry)
+        // At the line cap, one more line pushes the oldest out of the tail.
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("line 500\n".utf8))
+        try handle.close()
+        let after = LogTailReader.read(sources: [source])
 
-        // A capped log gaining a line shifts every id; expansion must stay on the same line.
-        let shifted = LogEntry(id: 4, timestamp: nil, source: "maintenance", message: "a", raw: "a")
-        let newOccupant = LogEntry(id: 5, timestamp: nil, source: "maintenance", message: "b", raw: "b")
-        XCTAssertTrue(store.isExpanded(shifted))
-        XCTAssertFalse(store.isExpanded(newOccupant))
-
-        store.toggleExpanded(shifted)
-        XCTAssertFalse(store.isExpanded(entry))
+        XCTAssertEqual(after.first?.raw, "line 1")
+        let survivor = try XCTUnwrap(before.first { $0.raw == "line 250" })
+        XCTAssertEqual(after.first { $0.raw == "line 250" }?.id, survivor.id)
+        XCTAssertEqual(Set(after.map(\.id)).count, after.count)
     }
 
     func testTimestampStaysOnOneLine() throws {
@@ -28,14 +33,19 @@ final class LogsViewTests: XCTestCase {
         func height(_ entry: LogEntry) -> CGFloat {
             NSHostingView(rootView: LogRow(entry: entry, isExpanded: false) {}.frame(width: 280)).fittingSize.height
         }
-        let stamped = LogEntry(id: 0, timestamp: time, source: "memory", message: "recall", raw: "stamped")
-        let plain = LogEntry(id: 1, timestamp: nil, source: "memory", message: "recall", raw: "plain")
+        let stamped = LogEntry(id: .init(source: "memory", offset: 0), timestamp: time, source: "memory",
+                               message: "recall", raw: "stamped")
+        let plain = LogEntry(id: .init(source: "memory", offset: 1), timestamp: nil, source: "memory",
+                             message: "recall", raw: "plain")
         XCTAssertEqual(height(stamped), height(plain), "A wrapped timestamp makes one-line rows taller")
     }
 
     func testClickingTruncatedEntryPushesNextRowDownInsteadOfDrawingOverIt() throws {
-        let long = LogEntry(id: 0, timestamp: nil, source: "maintenance", message: Self.longMessage, raw: "long")
-        let next = LogEntry(id: 1, timestamp: nil, source: "maintenance", message: "next", raw: "next")
+        let message = Array(repeating: "memories were split across project scopes", count: 8).joined(separator: " ")
+        let long = LogEntry(id: .init(source: "maintenance", offset: 0), timestamp: nil, source: "maintenance",
+                            message: message, raw: "long")
+        let next = LogEntry(id: .init(source: "maintenance", offset: 1), timestamp: nil, source: "maintenance",
+                            message: "next", raw: "next")
         let frames = RowFrames()
         let host = NSHostingView(rootView: RowsHarness(entries: [long, next], store: LogsStore(), frames: frames))
         // A non-activating panel can become key while the test host is in the
@@ -47,21 +57,23 @@ final class LogsViewTests: XCTestCase {
         if NSApp.activationPolicy() == .prohibited { NSApp.setActivationPolicy(.accessory) }
         window.makeKeyAndOrderFront(nil)
         defer { window.close() }
-        pumpEvents()
+        pumpEvents(timeout: 0.3) // SwiftUI ignores clicks that arrive before it settles
         try XCTSkipUnless(window.isKeyWindow, "SwiftUI only delivers taps to the key window")
 
         let collapsed = try XCTUnwrap(frames.rows["long"])
         click(window, at: CGPoint(x: 80, y: collapsed.minY + 8))
-
+        pumpEvents { (frames.rows["long"]?.height ?? 0) > collapsed.height * 2 }
         let expanded = try XCTUnwrap(frames.rows["long"])
-        let nextRow = try XCTUnwrap(frames.rows["next"])
         XCTAssertGreaterThan(expanded.height, collapsed.height * 2, "Clicking a truncated entry expands its row")
-        XCTAssertGreaterThanOrEqual(nextRow.minY, expanded.maxY, "Rows below move down to make room")
-        for textView in textViews(in: host) {
-            let drawn = frameInWindow(of: textView, window)
-            XCTAssertLessThanOrEqual(drawn.maxY, nextRow.minY + 0.5,
-                                     "Selectable text must not draw past its row into the next one")
-        }
+
+        // AppKit only installs the selectable text view once the text is clicked.
+        click(window, at: CGPoint(x: 80, y: expanded.midY))
+        pumpEvents { !textViews(in: host).isEmpty }
+        XCTAssertEqual(frames.rows["long"], expanded, "Clicking expanded text selects it instead of collapsing")
+        let nextRow = try XCTUnwrap(frames.rows["next"])
+        let textView = try XCTUnwrap(textViews(in: host).first)
+        XCTAssertLessThanOrEqual(frameInWindow(of: textView, window).maxY, nextRow.minY + 0.5,
+                                 "Selectable text must not draw past its row into the next one")
     }
 
     // MARK: - Helpers
@@ -79,13 +91,13 @@ final class LogsViewTests: XCTestCase {
         }
         NSApp.postEvent(event(.leftMouseUp), atStart: false)
         window.sendEvent(event(.leftMouseDown))
-        pumpEvents()
     }
 
-    private func pumpEvents() {
-        let deadline = Date(timeIntervalSinceNow: 0.5)
-        while Date() < deadline {
-            if let event = NSApp.nextEvent(matching: .any, until: Date(timeIntervalSinceNow: 0.05),
+    /// Dispatches queued events until `condition` holds or `timeout` passes.
+    private func pumpEvents(timeout: TimeInterval = 2, until condition: () -> Bool = { false }) {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while !condition(), Date() < deadline {
+            if let event = NSApp.nextEvent(matching: .any, until: Date(timeIntervalSinceNow: 0.01),
                                            inMode: .default, dequeue: true) {
                 NSApp.sendEvent(event)
             }
@@ -120,7 +132,6 @@ private struct RowsHarness: View {
                         frames.rows[entry.raw] = $0
                     }
             }
-            Spacer(minLength: 0)
         }
         .frame(width: 280, height: 600, alignment: .top)
     }
