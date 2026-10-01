@@ -31,6 +31,9 @@ final class LogsStore {
     }
     var autoScroll = true
     private(set) var filteredEntries: [LogEntry] = []
+    /// Keyed by raw line rather than id: ids are positions in the merged tail
+    /// and shift whenever a capped log file gains a line.
+    private var expandedEntries: Set<String> = []
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored nonisolated(unsafe) private var worker: Task<Void, Never>?
     @ObservationIgnored nonisolated(unsafe) private var continuation: AsyncStream<Void>.Continuation?
@@ -76,6 +79,16 @@ final class LogsStore {
             result = result.filter { $0.raw.lowercased().contains(query) }
         }
         filteredEntries = result
+    }
+
+    func isExpanded(_ entry: LogEntry) -> Bool {
+        expandedEntries.contains(entry.raw)
+    }
+
+    func toggleExpanded(_ entry: LogEntry) {
+        if expandedEntries.remove(entry.raw) == nil {
+            expandedEntries.insert(entry.raw)
+        }
     }
 
     func loadLogs() {
@@ -174,8 +187,10 @@ struct LogsContentView: View {
                             emptyState
                         } else {
                             ForEach(filtered) { entry in
-                                logRow(entry)
-                                    .id(entry.id)
+                                LogRow(entry: entry, isExpanded: store.isExpanded(entry)) {
+                                    store.toggleExpanded(entry)
+                                }
+                                .id(entry.id)
                             }
                         }
                     }
@@ -267,32 +282,6 @@ struct LogsContentView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Log Row
-
-    private func logRow(_ entry: LogEntry) -> some View {
-        let source = LogsStore.sources.first { $0.id == entry.source }
-        let color = source?.color ?? .white
-        return HStack(alignment: .top, spacing: 6) {
-            if let ts = entry.timestamp {
-                Text(Self.timeFormatter.string(from: ts))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.25))
-                    .frame(width: 42, alignment: .trailing)
-            }
-            Circle()
-                .fill(color)
-                .frame(width: 4, height: 4)
-                .padding(.top, 4)
-            Text(entry.message)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.7))
-                .lineLimit(3)
-                .textSelection(.enabled)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-    }
-
     private var emptyState: some View {
         VStack(spacing: 8) {
             Image(systemName: "doc.text")
@@ -309,8 +298,54 @@ struct LogsContentView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
     }
+}
 
-    // MARK: - Formatters
+// MARK: - Log Row
+
+/// Clicking a row toggles it between three truncated lines and the full message.
+struct LogRow: View {
+    let entry: LogEntry
+    let isExpanded: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        let source = LogsStore.sources.first { $0.id == entry.source }
+        let color = source?.color ?? .white
+        HStack(alignment: .top, spacing: 6) {
+            if let ts = entry.timestamp {
+                Text(Self.timeFormatter.string(from: ts))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.25))
+                    .fixedSize()
+            }
+            Circle()
+                .fill(color)
+                .frame(width: 4, height: 4)
+                .padding(.top, 4)
+            message
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.7))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onToggle)
+    }
+
+    /// Selection is only enabled once expanded: on macOS, clicking selectable
+    /// text swaps in an AppKit text view that ignores `lineLimit` and draws the
+    /// whole message over the rows below. Clicks on selectable text also never
+    /// reach the tap gesture, so an expanded row collapses from its margins.
+    @ViewBuilder private var message: some View {
+        if isExpanded {
+            Text(entry.message)
+                .textSelection(.enabled)
+        } else {
+            Text(entry.message)
+                .lineLimit(3)
+        }
+    }
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
