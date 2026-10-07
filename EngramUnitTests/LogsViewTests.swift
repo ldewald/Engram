@@ -6,26 +6,46 @@ import XCTest
 @MainActor
 final class LogsViewTests: XCTestCase {
     func testEntryIdsSurviveTheTailMoving() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("engram-log-ids-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appendingPathComponent("maintenance.log")
+        let file = try makeLogDirectory().appendingPathComponent("maintenance.log")
         let source = LogSource(id: "maintenance", label: "Maintenance", path: file.path, icon: "", color: .orange)
         try (0..<LogTailReader.maximumLines).map { "line \($0)\n" }.joined()
             .write(to: file, atomically: true, encoding: .utf8)
         let before = LogTailReader.read(sources: [source])
 
         // At the line cap, one more line pushes the oldest out of the tail.
-        let handle = try FileHandle(forWritingTo: file)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data("line 500\n".utf8))
-        try handle.close()
+        try append("line 500\n", to: file)
         let after = LogTailReader.read(sources: [source])
 
         XCTAssertEqual(after.first?.raw, "line 1")
         let survivor = try XCTUnwrap(before.first { $0.raw == "line 250" })
         XCTAssertEqual(after.first { $0.raw == "line 250" }?.id, survivor.id)
         XCTAssertEqual(Set(after.map(\.id)).count, after.count)
+    }
+
+    func testAutoScrollFiresWhenRowsArriveAboveAnUnchangedLastRow() throws {
+        let directory = try makeLogDirectory()
+        let mcp = directory.appendingPathComponent("memory.log")
+        let maintenance = directory.appendingPathComponent("maintenance.log")
+        try "[claude-memory] 2026-10-05T05:00:00Z recall one\n".write(to: mcp, atomically: true, encoding: .utf8)
+        try "Summary of maintenance\n".write(to: maintenance, atomically: true, encoding: .utf8)
+        let sources = [LogSource(id: "memory", label: "MCP", path: mcp.path, icon: "", color: .green),
+                       LogSource(id: "maintenance", label: "Maintenance", path: maintenance.path, icon: "", color: .orange)]
+        let store = LogsStore()
+        store.replaceEntries(with: LogTailReader.read(sources: sources))
+
+        // On "All", untimestamped lines sort last, so a new MCP row lands above an unchanged last row.
+        var revision = store.displayRevision
+        try append("[claude-memory] 2026-10-05T05:01:00Z recall two\n", to: mcp)
+        store.replaceEntries(with: LogTailReader.read(sources: sources))
+        XCTAssertEqual(store.filteredEntries.last?.raw, "Summary of maintenance")
+        XCTAssertNotEqual(store.displayRevision, revision, "Rows added on All must trigger auto-scroll")
+
+        store.selectedSource = "memory"
+        revision = store.displayRevision
+        try append("[claude-memory] 2026-10-05T05:02:00Z recall three\n", to: mcp)
+        store.replaceEntries(with: LogTailReader.read(sources: sources))
+        XCTAssertEqual(store.filteredEntries.last?.message, "recall three")
+        XCTAssertNotEqual(store.displayRevision, revision, "Rows added to the selected source must trigger auto-scroll")
     }
 
     func testTimestampStaysOnOneLine() throws {
@@ -66,17 +86,36 @@ final class LogsViewTests: XCTestCase {
         let expanded = try XCTUnwrap(frames.rows["long"])
         XCTAssertGreaterThan(expanded.height, collapsed.height * 2, "Clicking a truncated entry expands its row")
 
-        // AppKit only installs the selectable text view once the text is clicked.
+        // AppKit installs its selectable text view only once the text is clicked.
+        // Rather than depend on that view's class, check every view drawn from inside the row;
+        // containers that span the whole row are skipped.
+        let viewCount = descendants(of: host).count
         click(window, at: CGPoint(x: 80, y: expanded.midY))
-        pumpEvents { !textViews(in: host).isEmpty }
+        pumpEvents { descendants(of: host).count != viewCount }
         XCTAssertEqual(frames.rows["long"], expanded, "Clicking expanded text selects it instead of collapsing")
         let nextRow = try XCTUnwrap(frames.rows["next"])
-        let textView = try XCTUnwrap(textViews(in: host).first)
-        XCTAssertLessThanOrEqual(frameInWindow(of: textView, window).maxY, nextRow.minY + 0.5,
-                                 "Selectable text must not draw past its row into the next one")
+        for view in descendants(of: host) where !view.isHiddenOrHasHiddenAncestor {
+            let drawn = frameInWindow(of: view, window)
+            guard drawn.minY >= expanded.minY, drawn.minY < expanded.maxY, !drawn.contains(expanded) else { continue }
+            XCTAssertLessThanOrEqual(drawn.maxY, nextRow.minY + 0.5, "\(type(of: view)) draws past its row into the next one")
+        }
     }
 
     // MARK: - Helpers
+
+    private func makeLogDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("engram-logs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    private func append(_ text: String, to file: URL) throws {
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(text.utf8))
+    }
 
     /// Delivers a click the way AppKit would, including to any text-selection
     /// tracking loop that waits for its mouse-up on the event queue.
@@ -109,8 +148,8 @@ final class LogsViewTests: XCTestCase {
         return CGRect(x: rect.minX, y: window.frame.height - rect.maxY, width: rect.width, height: rect.height)
     }
 
-    private func textViews(in view: NSView) -> [NSTextView] {
-        (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(textViews(in:))
+    private func descendants(of view: NSView) -> [NSView] {
+        view.subviews.flatMap { [$0] + descendants(of: $0) }
     }
 }
 

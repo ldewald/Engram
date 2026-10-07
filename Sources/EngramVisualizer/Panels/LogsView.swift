@@ -37,6 +37,10 @@ final class LogsStore {
     }
     var autoScroll = true
     private(set) var filteredEntries: [LogEntry] = []
+    /// Bumped whenever the displayed rows change; auto-scroll keys off it. The
+    /// last row isn't enough: untimestamped lines sort last and often stay put
+    /// while rows are added above them.
+    private(set) var displayRevision = 0
     private var expandedEntries: Set<LogEntry.ID> = []
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored nonisolated(unsafe) private var worker: Task<Void, Never>?
@@ -83,6 +87,7 @@ final class LogsStore {
             result = result.filter { $0.raw.lowercased().contains(query) }
         }
         filteredEntries = result
+        displayRevision &+= 1
     }
 
     func isExpanded(_ entry: LogEntry) -> Bool {
@@ -127,7 +132,12 @@ final class LogsStore {
     }
 
     private func publish(_ entries: [LogEntry], generation: UInt64) {
-        guard generation == self.generation, self.entries != entries else { return }
+        guard generation == self.generation else { return }
+        replaceEntries(with: entries)
+    }
+
+    func replaceEntries(with entries: [LogEntry]) {
+        guard self.entries != entries else { return }
         self.entries = entries
     }
 
@@ -200,7 +210,7 @@ struct LogsContentView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .onChange(of: store.entries.last) { _, _ in
+                .onChange(of: store.displayRevision) { _, _ in
                     if store.autoScroll, let last = store.filteredEntries.last {
                         withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo(last.id, anchor: .bottom)
